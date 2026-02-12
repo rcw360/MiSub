@@ -1,5 +1,5 @@
 import { StorageFactory } from '../../storage-adapter.js';
-import { migrateConfigSettings, formatBytes, getCallbackToken, getPublicBaseUrl } from '../utils.js';
+import { migrateConfigSettings, formatBytes, getCallbackToken, getPublicBaseUrl, migrateProfileIds } from '../utils.js';
 import { generateCombinedNodeList } from '../../services/subscription-service.js';
 import { sendEnhancedTgNotification } from '../notifications.js';
 import { KV_KEY_SUBS, KV_KEY_PROFILES, KV_KEY_SETTINGS, DEFAULT_SETTINGS as defaultSettings } from '../config.js';
@@ -32,6 +32,13 @@ export async function handleMisubRequest(context) {
     const settings = settingsData || {};
     const allMisubs = misubsData || [];
     const allProfiles = profilesData || [];
+
+    // 自动迁移旧版 profile ID（去除 'profile_' 前缀）
+    if (migrateProfileIds(allProfiles)) {
+        storageAdapter.put(KV_KEY_PROFILES, allProfiles).catch(err =>
+            console.error('[Migration] Failed to persist migrated profile IDs:', err)
+        );
+    }
     // 关键：我们在这里定义了 `config`，后续都应该使用它
     const config = migrateConfigSettings({ ...defaultSettings, ...settings });
 
@@ -269,7 +276,10 @@ export async function handleMisubRequest(context) {
         context.startTime = Date.now();
 
         // Prepare log metadata to pass down
-        const clientIp = request.headers.get('CF-Connecting-IP') || 'N/A';
+        const clientIp = request.headers.get('CF-Connecting-IP')
+            || request.headers.get('X-Real-IP')
+            || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+            || 'N/A';
         const country = request.headers.get('CF-IPCountry') || 'N/A';
         const domain = url.hostname;
 
@@ -361,7 +371,10 @@ export async function handleMisubRequest(context) {
         // [Deferred Logging] Log Success for Base64 (Direct Return)
         if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
             // 发送 Telegram 通知（独立于访问日志开关，只需配置 BotToken 和 ChatID）
-            const clientIp = request.headers.get('CF-Connecting-IP') || 'N/A';
+            const clientIp = request.headers.get('CF-Connecting-IP')
+                || request.headers.get('X-Real-IP')
+                || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+                || 'N/A';
             context.waitUntil(
                 sendEnhancedTgNotification(
                     config,
@@ -396,6 +409,12 @@ export async function handleMisubRequest(context) {
     const callbackPath = profileIdentifier ? `/${token}/${profileIdentifier}` : `/${token}`;
     const publicBaseUrl = getPublicBaseUrl(env, url);
     const callbackUrl = `${publicBaseUrl.origin}${callbackPath}?target=base64&callback_token=${callbackToken}`;
+
+    // [Debug Logging for Docker/Zeabur]
+    if (!env.workers) { // 简单判断非 Workers 环境（Docker 环境通常没有 env.workers 属性，或者可以凭其他特征判断）
+        console.log(`[MiSub Debug] Profile: ${profileIdentifier}, Token: ${token}`);
+        console.log(`[MiSub Debug] Callback URL: ${callbackUrl}`);
+    }
     if (url.searchParams.get('callback_token') === callbackToken) {
         const headers = { "Content-Type": "text/plain; charset=utf-8", 'Cache-Control': 'no-store, no-cache' };
         return new Response(base64Content, { headers });
@@ -428,7 +447,10 @@ export async function handleMisubRequest(context) {
 
             // 发送通知和日志
             if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
-                const clientIp = request.headers.get('CF-Connecting-IP') || 'N/A';
+                const clientIp = request.headers.get('CF-Connecting-IP')
+                    || request.headers.get('X-Real-IP')
+                    || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+                    || 'N/A';
                 context.waitUntil(
                     sendEnhancedTgNotification(
                         config,
@@ -509,7 +531,10 @@ export async function handleMisubRequest(context) {
                 // [Deferred Logging] Log Success for Subconverter
                 if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
                     // 发送 Telegram 通知（独立于访问日志开关）
-                    const clientIp = request.headers.get('CF-Connecting-IP') || 'N/A';
+                    const clientIp = request.headers.get('CF-Connecting-IP')
+                        || request.headers.get('X-Real-IP')
+                        || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+                        || 'N/A';
                     context.waitUntil(
                         sendEnhancedTgNotification(
                             config,
@@ -580,7 +605,10 @@ export async function handleMisubRequest(context) {
 
         // [Fallback Success] 也发送 Telegram 通知，因为用户仍获取了订阅内容
         if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
-            const clientIp = request.headers.get('CF-Connecting-IP') || 'N/A';
+            const clientIp = request.headers.get('CF-Connecting-IP')
+                || request.headers.get('X-Real-IP')
+                || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+                || 'N/A';
             context.waitUntil(
                 sendEnhancedTgNotification(
                     config,
