@@ -5,7 +5,7 @@
 
 import { parseNodeList } from '../modules/utils/node-parser.js';
 import { getProcessedUserAgent } from '../utils/format-utils.js';
-import { prependNodeName, removeFlagEmoji, fixNodeUrlEncoding } from '../utils/node-utils.js';
+import { prependNodeName, removeFlagEmoji, fixNodeUrlEncoding, sanitizeNodeForYaml } from '../utils/node-utils.js';
 import { applyNodeTransformPipeline } from '../utils/node-transformer.js';
 import { createTimeoutFetch } from '../modules/utils.js';
 
@@ -155,7 +155,7 @@ export async function generateCombinedNodeList(context, config, userAgent, misub
     // 用户可以在模板中使用 {name} 变量来保留原始信息
     const skipPrefixDueToRenaming = nodeTransformConfig?.enabled && nodeTransformConfig?.rename?.template?.enabled;
 
-    const processedManualNodes = misubs.filter(sub => !sub.url.toLowerCase().startsWith('http')).map(node => {
+    const processedManualNodes = misubs.filter(sub => sub && sub.url && !sub.url.toLowerCase().startsWith('http')).map(node => {
         if (node.isExpiredNode) {
             return node.url; // Directly use the URL for expired node
         } else {
@@ -174,7 +174,7 @@ export async function generateCombinedNodeList(context, config, userAgent, misub
         }
     }).join('\n');
 
-    const httpSubs = misubs.filter(sub => sub.url.toLowerCase().startsWith('http'));
+    const httpSubs = misubs.filter(sub => sub && sub.url && sub.url.toLowerCase().startsWith('http'));
     const limiter = createConcurrencyLimiter(FETCH_CONFIG.CONCURRENCY);
 
     /**
@@ -254,9 +254,12 @@ export async function generateCombinedNodeList(context, config, userAgent, misub
         ? combinedLines
         : combinedLines.map(line => removeFlagEmoji(line));
 
+    // [Sanitize] Always sanitize node names for YAML compatibility (Subconverter issue with unquoted special chars)
+    const sanitizedLines = normalizedLines.map(line => sanitizeNodeForYaml(line));
+
     const outputLines = nodeTransformConfig?.enabled
-        ? applyNodeTransformPipeline(normalizedLines, { ...nodeTransformConfig, enableEmoji: templateContainsEmoji })
-        : [...new Set(normalizedLines)];
+        ? applyNodeTransformPipeline(sanitizedLines, { ...nodeTransformConfig, enableEmoji: templateContainsEmoji })
+        : [...new Set(sanitizedLines)];
     const uniqueNodesString = outputLines.join('\n');
 
     // 确保最终的字符串在非空时以换行符结束，以兼容 subconverter

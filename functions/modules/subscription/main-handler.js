@@ -6,7 +6,7 @@ import { KV_KEY_SUBS, KV_KEY_PROFILES, KV_KEY_SETTINGS, DEFAULT_SETTINGS as defa
 import { createDisguiseResponse } from '../disguise-page.js';
 import { generateCacheKey, setCache } from '../../services/node-cache-service.js';
 import { resolveRequestContext } from './request-context.js';
-import { buildSubconverterUrlVariants, getSubconverterCandidates } from './subconverter-client.js';
+import { buildSubconverterUrlVariants, getSubconverterCandidates, fetchFromSubconverter } from './subconverter-client.js';
 import { resolveNodeListWithCache } from './cache-manager.js';
 import { logAccessError, logAccessSuccess, shouldSkipLogging as shouldSkipAccessLog } from './access-logger.js';
 import { isBrowserAgent } from './user-agent-utils.js'; // [Added] Import centralized util
@@ -22,6 +22,12 @@ export async function handleMisubRequest(context) {
     const { request, env } = context;
     const url = new URL(request.url);
     const userAgentHeader = request.headers.get('User-Agent') || "Unknown";
+
+    // [Debug Logging Entry]
+    if (!env.workers) {
+        console.log(`\n[MiSub Request] ${request.method} ${url.pathname}${url.search}`);
+        console.log(`[MiSub UA] ${userAgentHeader}`);
+    }
 
     const storageAdapter = StorageFactory.createAdapter(env, await StorageFactory.getStorageType(env));
     const [settingsData, misubsData, profilesData] = await Promise.all([
@@ -46,6 +52,11 @@ export async function handleMisubRequest(context) {
 
     const isBrowser = isBrowserAgent(userAgentHeader);
 
+    // [Debug Logging Logic]
+    if (!env.workers) {
+        console.log(`[MiSub Logic] isBrowser: ${isBrowser}, Disguise: ${config.disguise?.enabled}`);
+    }
+
     const isAuthenticated = await authMiddleware(request, env);
 
     if (config.disguise?.enabled && isBrowser && !url.searchParams.has('callback_token') && !isAuthenticated) {
@@ -56,6 +67,11 @@ export async function handleMisubRequest(context) {
     }
 
     const { token, profileIdentifier } = resolveRequestContext(url, config, allProfiles);
+
+    // [Debug Logging Parse]
+    if (!env.workers) {
+        console.log(`[MiSub Parse] Token: ${token}, Profile: ${profileIdentifier}`);
+    }
     const shouldSkipLogging = shouldSkipAccessLog(userAgentHeader);
 
     let targetMisubs;
@@ -97,7 +113,7 @@ export async function handleMisubRequest(context) {
                 if (Array.isArray(profileSubIds)) {
                     profileSubIds.forEach(id => {
                         const sub = misubMap.get(id);
-                        if (sub && sub.enabled && sub.url.startsWith('http')) {
+                        if (sub && sub.enabled && typeof sub.url === 'string' && sub.url.startsWith('http')) {
                             targetMisubs.push(sub);
                         }
                     });
@@ -108,7 +124,7 @@ export async function handleMisubRequest(context) {
                 if (Array.isArray(profileNodeIds)) {
                     profileNodeIds.forEach(id => {
                         const node = misubMap.get(id);
-                        if (node && node.enabled && !node.url.startsWith('http')) {
+                        if (node && node.enabled && typeof node.url === 'string' && !node.url.startsWith('http')) {
                             targetMisubs.push(node);
                         }
                     });
@@ -339,7 +355,7 @@ export async function handleMisubRequest(context) {
             isDebugToken
         );
         const sourceNames = targetMisubs
-            .filter(s => s.url.startsWith('http'))
+            .filter(s => typeof s?.url === 'string' && s.url.startsWith('http'))
             .map(s => s.name || s.url);
         await setCache(storageAdapter, cacheKey, freshNodes, sourceNames);
         return freshNodes;
@@ -353,6 +369,10 @@ export async function handleMisubRequest(context) {
         context,
         targetMisubsCount: targetMisubs.length
     });
+
+    if (!env.workers) {
+        console.log(`[MiSub Nodes] Count/Length: ${combinedNodeList ? combinedNodeList.length : 0}`);
+    }
 
     const domain = url.hostname;
 
@@ -485,91 +505,64 @@ export async function handleMisubRequest(context) {
 
     const candidates = getSubconverterCandidates(effectiveSubConverter);
     let lastError = null;
-    const triedEndpoints = [];
 
-    for (const backend of candidates) {
-        const variants = buildSubconverterUrlVariants(backend);
-        for (const subconverterUrl of variants) {
-            triedEndpoints.push(subconverterUrl.origin + subconverterUrl.pathname);
-            try {
-                subconverterUrl.searchParams.set('target', targetFormat);
-                subconverterUrl.searchParams.set('url', callbackUrl);
-                if (shouldSkipCertificateVerify) {
-                    subconverterUrl.searchParams.set('scv', 'true');
-                }
-                if (shouldEnableUdp) {
-                    subconverterUrl.searchParams.set('udp', 'true');
-                }
-                subconverterUrl.searchParams.set('emoji', shouldUseEmoji ? 'true' : 'false');  // 根据模板动态设置 emoji 参数
-                if ((targetFormat === 'clash' || targetFormat === 'loon' || targetFormat === 'surge') && effectiveSubConfig && effectiveSubConfig.trim() !== '') {
-                    subconverterUrl.searchParams.set('config', effectiveSubConfig);
-                }
-                subconverterUrl.searchParams.set('new_name', 'true');
+    try {
+        // [New Implementation] Use centralized client
+        const result = await fetchFromSubconverter(candidates, {
+            targetFormat,
+            callbackUrl,
+            subConfig: effectiveSubConfig,
+            subName,
+            cacheHeaders,
+            enableScv: shouldSkipCertificateVerify,
+            enableUdp: shouldEnableUdp,
+            enableEmoji: shouldUseEmoji,
+            timeout: 30000 // 30s timeout
+        });
 
-                const subconverterResponse = await fetch(subconverterUrl.toString(), {
-                    method: 'GET',
-                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MiSub-Backend)' },
+        // [Success Logic]
+        if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
+            const clientIp = request.headers.get('CF-Connecting-IP')
+                || request.headers.get('X-Real-IP')
+                || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+                || 'N/A';
+            context.waitUntil(
+                sendEnhancedTgNotification(
+                    config,
+                    '🛰️ *订阅被访问*',
+                    clientIp,
+                    `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`${targetFormat}\`\n*订阅组:* \`${subName}\``
+                )
+            );
+
+            if (config.enableAccessLog) {
+                logAccessSuccess({
+                    context,
+                    env,
+                    request,
+                    userAgentHeader,
+                    targetFormat,
+                    token,
+                    profileIdentifier,
+                    subName,
+                    domain
                 });
-                if (!subconverterResponse.ok) {
-                    const errorBody = await subconverterResponse.text();
-                    lastError = new Error(`Subconverter(${subconverterUrl.origin}) returned status ${subconverterResponse.status}. Body: ${errorBody}`);
-                    console.warn('[SubConverter] Non-OK response, trying next backend if available:', lastError.message);
-                    continue;
-                }
-                const responseText = await subconverterResponse.text();
-
-                const responseHeaders = new Headers(subconverterResponse.headers);
-                responseHeaders.set("Content-Disposition", `attachment; filename*=utf-8''${encodeURIComponent(subName)}`);
-                responseHeaders.set('Content-Type', 'text/plain; charset=utf-8');
-                responseHeaders.set('Cache-Control', 'no-store, no-cache');
-
-                // 添加缓存状态头
-                Object.entries(cacheHeaders).forEach(([key, value]) => {
-                    responseHeaders.set(key, value);
-                });
-
-                // [Deferred Logging] Log Success for Subconverter
-                if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
-                    // 发送 Telegram 通知（独立于访问日志开关）
-                    const clientIp = request.headers.get('CF-Connecting-IP')
-                        || request.headers.get('X-Real-IP')
-                        || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
-                        || 'N/A';
-                    context.waitUntil(
-                        sendEnhancedTgNotification(
-                            config,
-                            '🛰️ *订阅被访问*',
-                            clientIp,
-                            `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`${targetFormat}\`\n*订阅组:* \`${subName}\``
-                        )
-                    );
-
-                    // 访问日志（需要 enableAccessLog 开关）
-                    if (config.enableAccessLog) {
-                        logAccessSuccess({
-                            context,
-                            env,
-                            request,
-                            userAgentHeader,
-                            targetFormat,
-                            token,
-                            profileIdentifier,
-                            subName,
-                            domain
-                        });
-                    }
-                }
-
-                return new Response(responseText, { status: subconverterResponse.status, statusText: subconverterResponse.statusText, headers: responseHeaders });
-            } catch (error) {
-                lastError = error;
-                console.warn(`[SubConverter] Error with backend ${subconverterUrl.origin}: ${error.message}. Trying next fallback if available.`);
             }
         }
+
+        return result.response;
+
+    } catch (e) {
+        lastError = e;
+        console.error('[MiSub] Subconverter call failed:', e);
     }
 
-    const errorMessage = lastError ? `${lastError.message}. Tried: ${triedEndpoints.join(', ')}` : 'Unknown subconverter error';
-    console.error(`[MiSub Final Error] ${errorMessage}`);
+    // 净化错误信息（移除换行符和双引号），防止 header 异常和 YAML 语法错误
+    const safeErrorMessage = (lastError ? lastError.message : 'Unknown subconverter error')
+        .replace(/[\r\n]+/g, ' ')
+        .replace(/"/g, "'")
+        .trim();
+    console.error(`[MiSub Final Error] ${safeErrorMessage}`);
 
     // [Deferred Logging] Log Error for Subconverter Failures (Timeout/Error)
     if (!url.searchParams.has('callback_token') && !shouldSkipLogging && config.enableAccessLog) {
@@ -583,7 +576,7 @@ export async function handleMisubRequest(context) {
             profileIdentifier,
             subName,
             domain,
-            errorMessage
+            errorMessage: safeErrorMessage
         });
     }
 
@@ -601,7 +594,7 @@ export async function handleMisubRequest(context) {
         });
 
         // 附带简短错误信息，防止 header 过长
-        fallbackHeaders.set('X-MiSub-Error', errorMessage.slice(0, 200));
+        fallbackHeaders.set('X-MiSub-Error', safeErrorMessage.slice(0, 200));
 
         // [Fallback Success] 也发送 Telegram 通知，因为用户仍获取了订阅内容
         if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
@@ -614,7 +607,7 @@ export async function handleMisubRequest(context) {
                     config,
                     '🛰️ *订阅被访问* (Fallback)',
                     clientIp,
-                    `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`base64\`\n*订阅组:* \`${subName}\``
+                    `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`base64\`\n*订阅组:* \`${subName}\`\n*错误:* \`${safeErrorMessage}\``
                 )
             );
         }
@@ -623,7 +616,7 @@ export async function handleMisubRequest(context) {
         if (targetFormat === 'clash' || targetFormat === 'loon' || targetFormat === 'surge') {
             const fallbackYaml = `
 proxies:
-  - name: "❌ 订阅生成失败 (Fallback)"
+  - name: "❌ 生成失败: ${safeErrorMessage.slice(0, 50).replace(/:/g, ' ')}"
     type: trojan
     server: 127.0.0.1
     port: 443
@@ -636,7 +629,7 @@ proxy-groups:
   - name: "⚠️ 错误节点"
     type: select
     proxies:
-      - "❌ 订阅生成失败 (Fallback)"
+      - "❌ 生成失败: ${safeErrorMessage.slice(0, 50).replace(/:/g, ' ')}"
 
 rules:
   - MATCH,DIRECT
@@ -646,7 +639,7 @@ rules:
                     "Content-Type": "text/yaml; charset=utf-8",
                     'Cache-Control': 'no-store, no-cache',
                     'X-MiSub-Fallback': 'yaml',
-                    'X-MiSub-Error': errorMessage.slice(0, 200)
+                    'X-MiSub-Error': safeErrorMessage.slice(0, 200)
                 },
                 status: 200
             });
@@ -656,5 +649,5 @@ rules:
         return new Response(fallbackContent, { headers: fallbackHeaders, status: 200 });
     }
 
-    return new Response(`Error connecting to subconverter: ${errorMessage}`, { status: 502 });
+    return new Response(`Error connecting to subconverter: ${safeErrorMessage}`, { status: 502 });
 }
